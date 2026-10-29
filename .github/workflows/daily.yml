@@ -1,0 +1,41 @@
+name: JD Price Daily Update
+
+on:
+  schedule:
+    - cron: '0 1 * * *' # 每天 UTC 1点（北京时间 9点）运行
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  update-prices:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Run tracker and build
+        env:
+          JD_COOKIE: ${{ secrets.JD_COOKIE }}
+        run: |
+          python tracker.py
+          python build.py
+
+      - name: Commit and push changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/prices.json docs/
+          git commit -m "Auto update price data [skip ci]" || exit 0
+          git push
