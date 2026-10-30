@@ -1,62 +1,45 @@
 import os
 import json
 import time
-import requests
-import urllib3
 from datetime import datetime
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from curl_cffi import requests  # 核心就在这里，引进了伪装库
 
 CONFIG_FILE = 'config.json'
 DATA_FILE = 'data/prices.json'
 
+# 读取配置
 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
-skus = config.get('skus', [])
 
-# 读取 Cookie
+# 优先从环境变量读取（GitHub 用），其次读配置文件（本地用）
 cookie_str = os.environ.get("JD_COOKIE", "").strip()
 if not cookie_str:
     cookie_str = config.get('cookie', '').strip()
 
-# 伪装成京东 App 的请求头
+skus = config.get('skus', [])
+
 headers = {
-    "User-Agent": "JD4iPhone/167169 (iPhone; iOS 13.4.1; Scale/3.00)",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9",
     "Cookie": cookie_str,
-    "Accept": "*/*",
-    "Connection": "keep-alive"
+    "Referer": "https://item.jd.com/"
 }
 
 def fetch_price(sku_id):
-    # 使用京东 App 端商品详情接口
-    url = "https://api.m.jd.com/client.action"
-    params = {
-        "functionId": "wareBusiness",
-        "appid": "wareBusiness",
-        "body": json.dumps({"skuId": str(sku_id), "cat": ["10", "20", "30"]}),
-        "client": "apple",
-        "clientVersion": "13.0.0",
-        "networkType": "wifi",
-    }
-    
+    url = f"https://p.3.cn/prices/mgets?skuIds=J_{sku_id}&type=1"
     try:
-        res = requests.get(url, headers=headers, params=params, timeout=10, verify=False)
-        res_json = res.json()
-        
-        # 尝试提取价格
-        price_info = None
-        if "price" in res_json and "p" in res_json["price"]:
-            price_info = res_json["price"]["p"]
-        elif "price" in res_json and "price" in res_json["price"]:
-            price_info = res_json["price"]["price"]
-            
-        if price_info:
-            return float(price_info)
+        # impersonate="chrome120" 是灵魂，假装自己是真实的 Chrome 浏览器
+        res = requests.get(url, headers=headers, impersonate="chrome120", timeout=15)
+        data = res.json()
+        if data and len(data) > 0:
+            return float(data[0].get('p', 0))
         return None
     except Exception as e:
+        print(f"  -> 接口请求异常: {e}")
         return None
 
-# 读取旧数据
+# 读取历史数据
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -65,13 +48,13 @@ else:
 
 today = datetime.now().strftime('%Y-%m-%d')
 
-print("开始通过京东接口抓取价格...")
+print("开始通过超级浏览器指纹抓取价格...")
 for item in skus:
     sku_id = str(item['sku'])
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 处理 {sku_id} 【{item['name']}】")
     
     price = fetch_price(sku_id)
-    if price:
+    if price and price > 0:
         print(f"  -> 🎉 成功获取真实价格: ¥{price}")
         
         if sku_id not in data:
@@ -88,10 +71,11 @@ for item in skus:
         })
         data[sku_id]["records"] = records
     else:
-        print(f"  -> ❌ 抓取失败：接口返回空数据 (Cookie 失效或被风控)")
+        print(f"  -> ❌ 抓取失败：接口返回空数据")
     
     time.sleep(2)
 
+# 保存数据
 with open(DATA_FILE, 'w', encoding='utf-8') as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
 
