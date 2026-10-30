@@ -1,11 +1,9 @@
 import os
 import json
 import time
-import requests
-import urllib3
+import re
 from datetime import datetime
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from playwright.sync_api import sync_playwright
 
 CONFIG_FILE = 'config.json'
 DATA_FILE = 'data/prices.json'
@@ -14,35 +12,17 @@ with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
 skus = config.get('skus', [])
 
-# 优先从 GitHub Secrets 读取 Cookie
+# 优先从环境变量读取（GitHub Secrets），其次读取配置文件
 cookie_str = os.environ.get("JD_COOKIE", "").strip()
 if not cookie_str:
     cookie_str = config.get('cookie', '').strip()
 
-# 伪装成手机京东 App 的请求头
-headers = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 JD4iPhone/12.0.0",
-    "Cookie": cookie_str,
-    "Accept": "application/json",
-    "Content-Type": "application/x-www-form-urlencoded"
-}
-
-def fetch_price(sku_id):
-    # 京东 H5/小程序获取商品详情的接口
-    url = f"https://item.m.jd.com/ware/detail.json?wareId={sku_id}"
-    try:
-        res = requests.get(url, headers=headers, timeout=10, verify=False)
-        res_json = res.json()
-        
-        # 尝试提取价格
-        if "price" in res_json and "p" in res_json["price"]:
-            return float(res_json["price"]["p"])
-        elif "price" in res_json:
-            return float(res_json["price"])
-        return None
-    except Exception as e:
-        print(f"  -> 请求异常: {e}")
-        return None
+cookies = []
+if cookie_str:
+    for item in cookie_str.split(';'):
+        if '=' in item:
+            name, value = item.strip().split('=', 1)
+            cookies.append({'name': name, 'value': value, 'domain': '.jd.com', 'path': '/'})
 
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, 'r', encoding='utf-8') as f:
@@ -52,33 +32,102 @@ else:
 
 today = datetime.now().strftime('%Y-%m-%d')
 
-print("开始通过手机版接口抓取价格...")
-for item in skus:
-    sku_id = str(item['sku'])
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 处理 {sku_id} 【{item['name']}】")
+print("正在启动伪装浏览器抓取，请稍候...")
+with sync_playwright() as p:
+    # 使用 channel="chrome" 强制调用服务器上的真实 Chrome，并加上深度防检测参数
+    browser = p.chromium.launch(
+        headless=True, 
+        channel="chrome",
+        args=[
+            '--no-sandbox', 
+            '--disable-setuid-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-infobars',
+            '--window-size=1920,1080'
+        ]
+    )
     
-    price = fetch_price(sku_id)
-    if price and price > 0:
-        print(f"  -> 🎉 成功获取真实价格: ¥{price}")
-        
-        if sku_id not in data:
-            data[sku_id] = {"records": []}
-            
-        records = data[sku_id].get("records", [])
-        records = [r for r in records if r.get('date') != today]
-        records.append({
-            "date": today,
-            "list_price": price,
-            "final_price": price,
-            "coupon": 0,
-            "market_price": price
-        })
-        data[sku_id]["records"] = records
-    else:
-        print(f"  - ❌ 抓取失败：接口返回了空数据。")
+    context = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        viewport={"width": 1920, "height": 1080},
+        device_scale_factor=1,
+        is_mobile=False,
+        has_touch=False
+    )
     
-    time.sleep(1.5)
+    # 注入终极防检测脚本（抹除 webdriver 痕迹）
+    context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.navigator.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    """)
+    
+    if cookies:
+        context.add_cookies(cookies)
+    
+    page = context.new_page()
 
+    for item in skus:
+        sku_id = str(item['sku'])
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 处理 {sku_id} 【{item['name']}】")
+        url = f"https://item.jd.com/{sku_id}.html"
+        
+        try:
+            # 使用 networkidle 等待所有网络请求彻底结束，确保价格渲染完毕
+            page.goto(url, timeout=60000, wait_until="networkidle")
+            time.sleep(3) 
+            
+            # 如果遇到风控拦截页，尝试重新加载一次
+            if "pc-frequent-pro" in page.url or "risk_handler" in page.url:
+                print("  -> 触发拦截，尝试重新加载...")
+                page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                time.sleep(3)
+
+            # 多维度获取价格
+            price_text = ""
+            try:
+                # 方案 A：常规 Web 端价格类
+                price_text = page.locator(".price").first.inner_text(timeout=8000)
+            except:
+                try:
+                    # 方案 B：京东移动端/特殊活动页面价格类
+                    price_text = page.locator(".p-price .price").first.inner_text(timeout=5000)
+                except:
+                    # 方案 C：直接扒网页源码用正则强搜
+                    content = page.content()
+                    match = re.search(r'"p":"(\d+\.\d+)"', content)
+                    if match:
+                        price_text = match.group(1)
+
+            if price_text:
+                price = float(''.join(c for c in price_text if c.isdigit() or c == '.'))
+                print(f"  -> 🎉 成功获取价格: ¥{price}")
+                
+                if sku_id not in data:
+                    data[sku_id] = {"records": []}
+                    
+                records = data[sku_id].get("records", [])
+                records = [r for r in records if r.get('date') != today]
+                records.append({
+                    "date": today,
+                    "list_price": price,
+                    "final_price": price,
+                    "coupon": 0,
+                    "market_price": price
+                })
+                data[sku_id]["records"] = records
+            else:
+                print(f"  -> ❌ 抓取失败：页面未找到价格元素")
+            
+        except Exception as e:
+            print(f"  -> ❌ 抓取失败: 页面加载超时或异常")
+            
+        time.sleep(2)
+
+    browser.close()
+
+# 保存数据
 with open(DATA_FILE, 'w', encoding='utf-8') as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
 
