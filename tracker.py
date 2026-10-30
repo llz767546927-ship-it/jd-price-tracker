@@ -1,9 +1,11 @@
 import os
 import json
 import time
-import re
+import requests
+import urllib3
 from datetime import datetime
-from playwright.sync_api import sync_playwright
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CONFIG_FILE = 'config.json'
 DATA_FILE = 'data/prices.json'
@@ -12,18 +14,49 @@ with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
 skus = config.get('skus', [])
 
-# 优先从环境变量读取（GitHub Secrets），其次读取配置文件
+# 读取 Cookie
 cookie_str = os.environ.get("JD_COOKIE", "").strip()
 if not cookie_str:
     cookie_str = config.get('cookie', '').strip()
 
-cookies = []
-if cookie_str:
-    for item in cookie_str.split(';'):
-        if '=' in item:
-            name, value = item.strip().split('=', 1)
-            cookies.append({'name': name, 'value': value, 'domain': '.jd.com', 'path': '/'})
+# 伪装成京东 App 的请求头
+headers = {
+    "User-Agent": "JD4iPhone/167169 (iPhone; iOS 13.4.1; Scale/3.00)",
+    "Cookie": cookie_str,
+    "Accept": "*/*",
+    "Connection": "keep-alive"
+}
 
+def fetch_price(sku_id):
+    # 使用京东 App 端商品详情接口
+    url = "https://api.m.jd.com/client.action"
+    params = {
+        "functionId": "wareBusiness",
+        "appid": "wareBusiness",
+        "body": json.dumps({"skuId": str(sku_id), "cat": ["10", "20", "30"]}),
+        "client": "apple",
+        "clientVersion": "13.0.0",
+        "networkType": "wifi",
+    }
+    
+    try:
+        res = requests.get(url, headers=headers, params=params, timeout=10, verify=False)
+        res_json = res.json()
+        
+        # 尝试提取价格
+        price_info = None
+        if "price" in res_json and "p" in res_json["price"]:
+            price_info = res_json["price"]["p"]
+        elif "price" in res_json and "price" in res_json["price"]:
+            price_info = res_json["price"]["price"]
+            
+        if price_info:
+            return float(price_info)
+        return None
+    except Exception as e:
+        return None
+
+# 读取旧数据
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -32,102 +65,33 @@ else:
 
 today = datetime.now().strftime('%Y-%m-%d')
 
-print("正在启动伪装浏览器抓取，请稍候...")
-with sync_playwright() as p:
-    # 使用 channel="chrome" 强制调用服务器上的真实 Chrome，并加上深度防检测参数
-    browser = p.chromium.launch(
-        headless=True, 
-        channel="chrome",
-        args=[
-            '--no-sandbox', 
-            '--disable-setuid-sandbox',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-infobars',
-            '--window-size=1920,1080'
-        ]
-    )
+print("开始通过京东接口抓取价格...")
+for item in skus:
+    sku_id = str(item['sku'])
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 处理 {sku_id} 【{item['name']}】")
     
-    context = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        viewport={"width": 1920, "height": 1080},
-        device_scale_factor=1,
-        is_mobile=False,
-        has_touch=False
-    )
-    
-    # 注入终极防检测脚本（抹除 webdriver 痕迹）
-    context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.navigator.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    """)
-    
-    if cookies:
-        context.add_cookies(cookies)
-    
-    page = context.new_page()
-
-    for item in skus:
-        sku_id = str(item['sku'])
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 处理 {sku_id} 【{item['name']}】")
-        url = f"https://item.jd.com/{sku_id}.html"
+    price = fetch_price(sku_id)
+    if price:
+        print(f"  -> 🎉 成功获取真实价格: ¥{price}")
         
-        try:
-            # 使用 networkidle 等待所有网络请求彻底结束，确保价格渲染完毕
-            page.goto(url, timeout=60000, wait_until="networkidle")
-            time.sleep(3) 
+        if sku_id not in data:
+            data[sku_id] = {"records": []}
             
-            # 如果遇到风控拦截页，尝试重新加载一次
-            if "pc-frequent-pro" in page.url or "risk_handler" in page.url:
-                print("  -> 触发拦截，尝试重新加载...")
-                page.goto(url, timeout=60000, wait_until="domcontentloaded")
-                time.sleep(3)
+        records = data[sku_id].get("records", [])
+        records = [r for r in records if r.get('date') != today]
+        records.append({
+            "date": today,
+            "list_price": price,
+            "final_price": price,
+            "coupon": 0,
+            "market_price": price
+        })
+        data[sku_id]["records"] = records
+    else:
+        print(f"  -> ❌ 抓取失败：接口返回空数据 (Cookie 失效或被风控)")
+    
+    time.sleep(2)
 
-            # 多维度获取价格
-            price_text = ""
-            try:
-                # 方案 A：常规 Web 端价格类
-                price_text = page.locator(".price").first.inner_text(timeout=8000)
-            except:
-                try:
-                    # 方案 B：京东移动端/特殊活动页面价格类
-                    price_text = page.locator(".p-price .price").first.inner_text(timeout=5000)
-                except:
-                    # 方案 C：直接扒网页源码用正则强搜
-                    content = page.content()
-                    match = re.search(r'"p":"(\d+\.\d+)"', content)
-                    if match:
-                        price_text = match.group(1)
-
-            if price_text:
-                price = float(''.join(c for c in price_text if c.isdigit() or c == '.'))
-                print(f"  -> 🎉 成功获取价格: ¥{price}")
-                
-                if sku_id not in data:
-                    data[sku_id] = {"records": []}
-                    
-                records = data[sku_id].get("records", [])
-                records = [r for r in records if r.get('date') != today]
-                records.append({
-                    "date": today,
-                    "list_price": price,
-                    "final_price": price,
-                    "coupon": 0,
-                    "market_price": price
-                })
-                data[sku_id]["records"] = records
-            else:
-                print(f"  -> ❌ 抓取失败：页面未找到价格元素")
-            
-        except Exception as e:
-            print(f"  -> ❌ 抓取失败: 页面加载超时或异常")
-            
-        time.sleep(2)
-
-    browser.close()
-
-# 保存数据
 with open(DATA_FILE, 'w', encoding='utf-8') as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
 
